@@ -18,6 +18,8 @@ from typing import Any, Protocol
 from .audit import AuditLog
 from .config import Config
 from .llm import LLMError, LLMRouter, Message, ToolCall
+from .memory import MemoryStore
+from .planner import Plan, Planner, looks_compound
 from .safety import Decision, SafetyEngine, Verdict
 from .skills.base import ActionDef, ActionResult, ExecContext, RiskLevel
 from .skills.registry import SkillRegistry
@@ -84,6 +86,7 @@ class TurnResult:
     provider: str = ""
     model: str = ""
     error: str | None = None
+    plan: Plan | None = None
 
 
 @dataclass
@@ -95,11 +98,34 @@ class ApprovalResponse:
     note: str = ""
 
 
+@dataclass
+class PlanResponse:
+    """What an interface hands back when shown a multi-step plan."""
+
+    approved: bool
+    steps: list[str] | None = None    # edited step descriptions, when changed
+    note: str = ""
+
+
 class Approver(Protocol):
-    """Anything that can review a proposal: a prompt, a GUI queue, or a policy."""
+    """Anything that can review a proposal: a prompt, a GUI queue, or a policy.
+
+    An interface may also implement ``review_plan(plan) -> PlanResponse`` to
+    review a multi-step plan before any of it runs. Interfaces that do not are
+    treated as approving the plan; every individual action in it is still
+    reviewed one by one.
+    """
 
     def review(self, proposal: Proposal, dry_run_result: ActionResult | None) \
         -> ApprovalResponse: ...  # pragma: no cover - interface
+
+
+def review_plan(approver: Any, plan: Plan) -> PlanResponse:
+    """Ask an approver about a plan, tolerating approvers that do not care."""
+    hook = getattr(approver, "review_plan", None)
+    if hook is None:
+        return PlanResponse(True, note="no plan review implemented")
+    return hook(plan)
 
 
 class AutoApprover:
@@ -123,12 +149,16 @@ class Supervisor:
 
     def __init__(self, config: Config, registry: SkillRegistry, audit: AuditLog,
                  router: LLMRouter | None = None,
-                 safety: SafetyEngine | None = None) -> None:
+                 safety: SafetyEngine | None = None,
+                 memory: MemoryStore | None = None,
+                 planner: Planner | None = None) -> None:
         self.config = config
         self.registry = registry
         self.audit = audit
         self.router = router or LLMRouter(config)
         self.safety = safety or SafetyEngine(config)
+        self.memory = memory or MemoryStore(audit, config.memory_enabled)
+        self.planner = planner or Planner(config.planner_max_steps)
 
     def handle(self, request: str, approver: Approver, *, dry_run: bool | None = None,
                interface: str = "cli",
@@ -143,13 +173,42 @@ class Supervisor:
             dry_run=bool(dry_run),
         )
 
+        tools = self.registry.tool_schemas()
+        system_parts = [SYSTEM_PROMPT]
+        remembered = self.memory.context_block(self.config.memory_context_items)
+        if remembered:
+            system_parts.append(remembered)
+
+        budget = max(1, self.config.max_tool_iterations)
+        if self.config.planner_enabled and looks_compound(request):
+            plan, plan_error = self._make_plan(request, provider, tools)
+            if plan_error:
+                turn.error = plan_error
+            if plan and plan.steps:
+                turn.plan = plan
+                emit = on_event or (lambda *_: None)
+                emit("plan", plan)
+                # A single step needs no separate sign-off: the action itself is
+                # reviewed either way. A multi-step plan is approved as a whole.
+                if plan.multi_step and not dry_run:
+                    verdict = review_plan(approver, plan)
+                    if not verdict.approved:
+                        turn.reply = "Plan rejected; nothing was run."
+                        self.audit.finish_request(turn.request_id, turn.reply)
+                        return turn
+                    if verdict.steps:
+                        plan = _replace_steps(plan, verdict.steps)
+                        turn.plan = plan
+                system_parts.append(plan.as_context())
+                # One tool call per step, plus room to summarize at the end.
+                budget = max(budget, len(plan.steps) + 2)
+
         messages: list[Message] = [
-            Message("system", SYSTEM_PROMPT),
+            Message("system", "\n\n".join(system_parts)),
             Message("user", request),
         ]
-        tools = self.registry.tool_schemas()
 
-        for _ in range(max(1, self.config.max_tool_iterations)):
+        for _ in range(budget):
             try:
                 response = provider.chat(messages, tools)
             except LLMError as exc:
@@ -177,8 +236,22 @@ class Supervisor:
 
         if not turn.reply and turn.outcomes:
             turn.reply = "; ".join(o.message for o in turn.outcomes)
+        self._learn(turn)
         self.audit.finish_request(turn.request_id, turn.reply)
         return turn
+
+    def _make_plan(self, request: str, provider: Any,
+                   tools: list[dict[str, Any]]) -> tuple[Plan | None, str]:
+        """Plan the request. A planning failure degrades to acting directly."""
+        try:
+            return self.planner.plan(request, provider, tools), ""
+        except LLMError as exc:
+            return None, f"Could not plan the request: {exc}"
+
+    def _learn(self, turn: TurnResult) -> None:
+        executed = [o for o in turn.outcomes if o.status == "executed"]
+        self.memory.observe(turn.outcomes)
+        self.memory.note_workflow(turn.request, [o.proposal.action.name for o in executed])
 
     # -- internals ------------------------------------------------------
     def _prepare(self, call: ToolCall) -> Proposal:
@@ -266,6 +339,19 @@ class Supervisor:
                 result.undo.description or proposal.summary,
             )
         return Outcome(proposal, status, result, undo_id)
+
+
+def _replace_steps(plan: Plan, descriptions: list[str]) -> Plan:
+    """Rebuild a plan from step text the user edited."""
+    from .planner import PlanStep
+
+    steps = [
+        PlanStep(index + 1, description.strip(),
+                 plan.steps[index].action if index < len(plan.steps) else None)
+        for index, description in enumerate(descriptions)
+        if description.strip()
+    ]
+    return Plan(request=plan.request, steps=steps, notes=plan.notes)
 
 
 def _tool_result_text(outcome: Outcome) -> str:

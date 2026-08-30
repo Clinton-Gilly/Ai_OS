@@ -7,6 +7,10 @@
     ai-os undo                          take the last change back
     ai-os settings ...                  provider, keys, permissions, whitelist
     ai-os gui                           the chat window
+    ai-os palette                       the command palette on its own
+    ai-os listen                        speak a request (push-to-talk)
+    ai-os diagnose                      why is my computer slow
+    ai-os memory ...                    inspect and edit what it remembers
 """
 
 from __future__ import annotations
@@ -18,12 +22,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .agent import ApprovalResponse, AutoApprover, Proposal, TurnResult
+from .agent import ApprovalResponse, AutoApprover, PlanResponse, Proposal, TurnResult
 from .app import AiOS
 from .config import POLICIES
 from .llm.router import PROVIDERS
+from .memory import KINDS
 from .paths import app_home
+from .planner import Plan
 from .skills.base import ActionResult, RiskLevel
+from .voice import build_transcriber
 
 RISK_MARK = {
     RiskLevel.READ_ONLY: "[auto]",
@@ -35,8 +42,14 @@ RISK_MARK = {
 class ConsoleApprover:
     """The terminal approval queue: approve, reject, or edit before running."""
 
-    def __init__(self, stream=sys.stdout) -> None:
-        self.stream = stream
+    def __init__(self, stream: Any = None) -> None:
+        # Resolved per write, not bound at import time, so redirected output
+        # (tests, piping, the GUI) still reaches the right place.
+        self._stream = stream
+
+    @property
+    def stream(self) -> Any:
+        return self._stream if self._stream is not None else sys.stdout
 
     def review(self, proposal: Proposal,
                dry_run_result: ActionResult | None = None) -> ApprovalResponse:
@@ -66,6 +79,44 @@ class ConsoleApprover:
                     return ApprovalResponse(True, args=edited, note="edited")
             print("  Please answer a, r, or e.", file=self.stream)
 
+    def review_plan(self, plan: Plan) -> PlanResponse:
+        print(file=self.stream)
+        print("  Plan:", file=self.stream)
+        for step in plan.steps:
+            print(f"    {step.render()}", file=self.stream)
+        if plan.notes:
+            print(f"  Note: {plan.notes}", file=self.stream)
+
+        while True:
+            try:
+                answer = input("  Run this plan? [a]pprove / [r]eject / [e]dit? ") \
+                    .strip().lower()
+            except EOFError:
+                return PlanResponse(False, note="no input available")
+            if answer in ("a", "approve", "y", "yes"):
+                return PlanResponse(True)
+            if answer in ("r", "reject", "n", "no", ""):
+                return PlanResponse(False)
+            if answer in ("e", "edit"):
+                steps = self._edit_plan(plan)
+                if steps is not None:
+                    return PlanResponse(True, steps=steps, note="edited")
+            print("  Please answer a, r, or e.", file=self.stream)
+
+    def _edit_plan(self, plan: Plan) -> list[str] | None:
+        print("  Edit each step. Enter keeps it, a blank dash '-' drops it.",
+              file=self.stream)
+        edited: list[str] = []
+        for step in plan.steps:
+            try:
+                answer = input(f"    {step.number}. [{step.description}]: ").strip()
+            except EOFError:
+                return None
+            if answer == "-":
+                continue
+            edited.append(answer or step.description)
+        return edited or None
+
     def _edit(self, proposal: Proposal) -> dict[str, Any] | None:
         edited = dict(proposal.args)
         for param in proposal.action.params:
@@ -88,15 +139,43 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run a single natural-language request.")
     run.add_argument("request", nargs="+", help="What you want done.")
     run.add_argument("--dry-run", action="store_true", help="Preview without changing anything.")
+    run.add_argument("--no-plan", action="store_true",
+                     help="Skip the planner and act on the request directly.")
     run.add_argument("--yes", action="store_true",
                      help="Approve every action automatically (use with care).")
     run.add_argument("--json", action="store_true", help="Print the result as JSON.")
 
     chat = sub.add_parser("chat", help="Start an interactive session.")
     chat.add_argument("--dry-run", action="store_true", help="Preview everything.")
+    chat.add_argument("--no-plan", action="store_true",
+                      help="Skip the planner and act on each request directly.")
 
     sub.add_parser("skills", help="List the registered skills and actions.")
     sub.add_parser("gui", help="Open the chat window.")
+    sub.add_parser("palette", help="Open the command palette on its own.")
+
+    listen = sub.add_parser("listen", help="Speak a request (push-to-talk).")
+    listen.add_argument("--seconds", type=int, default=0,
+                        help="How long to listen for; defaults to the setting.")
+    listen.add_argument("--dry-run", action="store_true", help="Preview only.")
+
+    diagnose = sub.add_parser("diagnose", help="Investigate slow performance.")
+    diagnose.add_argument("--json", action="store_true")
+
+    memory = sub.add_parser("memory", help="Inspect and edit what AI OS remembers.")
+    memory_sub = memory.add_subparsers(dest="memory_command")
+    memory_list = memory_sub.add_parser("list", help="Show everything remembered.")
+    memory_list.add_argument("--kind", default="", choices=["", *KINDS])
+    memory_list.add_argument("--search", default="")
+    memory_set = memory_sub.add_parser("remember", help="Remember something.")
+    memory_set.add_argument("kind", choices=list(KINDS))
+    memory_set.add_argument("key")
+    memory_set.add_argument("value")
+    memory_forget = memory_sub.add_parser("forget", help="Forget remembered items.")
+    memory_forget.add_argument("--kind", default="", choices=["", *KINDS])
+    memory_forget.add_argument("--key", default="")
+    memory_forget.add_argument("--all", action="store_true",
+                               help="Forget everything AI OS remembers.")
 
     audit = sub.add_parser("audit", help="Show the local audit log.")
     audit.add_argument("--limit", type=int, default=20)
@@ -146,6 +225,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "undo": cmd_undo,
             "settings": cmd_settings,
             "gui": cmd_gui,
+            "palette": cmd_palette,
+            "listen": cmd_listen,
+            "diagnose": cmd_diagnose,
+            "memory": cmd_memory,
         }
         return handlers[command](app, args)
     finally:
@@ -155,6 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 # -- commands -----------------------------------------------------------
 def cmd_run(app: AiOS, args: argparse.Namespace) -> int:
     request = " ".join(args.request)
+    if getattr(args, "no_plan", False):
+        app.config.planner_enabled = False
     approver = AutoApprover() if getattr(args, "yes", False) else ConsoleApprover()
     turn = app.supervisor.handle(request, approver, dry_run=args.dry_run)
     if getattr(args, "json", False):
@@ -165,6 +250,8 @@ def cmd_run(app: AiOS, args: argparse.Namespace) -> int:
 
 
 def cmd_chat(app: AiOS, args: argparse.Namespace) -> int:
+    if getattr(args, "no_plan", False):
+        app.config.planner_enabled = False
     provider = app.router.build()
     print(f"AI OS — provider: {provider.name} ({provider.model or 'default model'})")
     print(f"Data directory: {app_home()}")
@@ -345,8 +432,101 @@ def cmd_gui(app: AiOS, args: argparse.Namespace) -> int:
     return run_gui(app)
 
 
+def cmd_palette(app: AiOS, args: argparse.Namespace) -> int:
+    from .gui.window import run_gui
+
+    return run_gui(app, palette_only=True)
+
+
+def cmd_listen(app: AiOS, args: argparse.Namespace) -> int:
+    transcriber = build_transcriber(app.config.voice_enabled)
+    if not app.config.voice_enabled:
+        print("Voice input is off. Turn it on with: "
+              "ai-os settings set voice-enabled true")
+        return 1
+    if not transcriber.available():
+        from .voice import INSTALL_HINT
+
+        print(INSTALL_HINT)
+        return 1
+
+    seconds = args.seconds or app.config.voice_seconds
+    print(f"Listening for up to {seconds}s… speak now.")
+    result = transcriber.transcribe(seconds, app.config.voice_language)
+    if not result.ok:
+        print(result.error)
+        return 1
+
+    print(f'Heard: "{result.text}"')
+    turn = app.supervisor.handle(result.text, ConsoleApprover(), dry_run=args.dry_run,
+                                 interface="voice")
+    _print_turn(turn)
+    return 0 if not turn.error else 1
+
+
+def cmd_diagnose(app: AiOS, args: argparse.Namespace) -> int:
+    action = app.registry.get("diag_report")
+    if action is None:
+        print("The diagnostics skill is not registered.")
+        return 1
+    from .skills.base import ExecContext
+
+    result = action.handler({}, ExecContext(dry_run=False, config=app.config))
+    if args.json:
+        print(json.dumps(result.data, indent=2, default=str))
+        return 0
+    for finding in result.data.get("findings", []):
+        print(f"  - {finding}")
+    suggestions = result.data.get("suggestions", [])
+    if suggestions:
+        print("\nSuggested:")
+        for suggestion in suggestions:
+            print(f"  - {suggestion}")
+    return 0
+
+
+def cmd_memory(app: AiOS, args: argparse.Namespace) -> int:
+    command = getattr(args, "memory_command", None) or "list"
+
+    if command == "list":
+        items = app.memory.search(args.search) if args.search \
+            else app.memory.items(args.kind)
+        if not items:
+            print("Nothing is remembered yet.")
+            return 0
+        for item in items:
+            print(f"  [{item.kind}] {item.describe()}")
+        print(f"\n{len(items)} item(s). Forget one with: "
+              "ai-os memory forget --kind KIND --key KEY")
+        return 0
+
+    if command == "remember":
+        app.memory.remember(args.kind, args.key, args.value)
+        print(f"Remembered {args.kind}: {args.key} = {args.value}")
+        return 0
+
+    if command == "forget":
+        if not (args.all or args.kind or args.key):
+            print("Nothing selected. Pass --kind, --key, or --all.")
+            return 1
+        if args.key and not args.kind:
+            print("--key needs --kind as well.")
+            return 1
+        count = app.memory.forget("" if args.all else args.kind,
+                                  "" if args.all else args.key)
+        print(f"Forgot {count} item(s).")
+        return 0
+
+    print("Unknown memory command.")
+    return 1
+
+
 # -- output helpers -----------------------------------------------------
 def _print_turn(turn: TurnResult) -> None:
+    if turn.plan and turn.plan.multi_step:
+        print("  Plan:")
+        for step in turn.plan.steps:
+            print(f"    {step.render()}")
     for outcome in turn.outcomes:
         icon = {
             "executed": "OK",
@@ -370,6 +550,7 @@ def _turn_as_dict(turn: TurnResult) -> dict[str, Any]:
         "provider": turn.provider,
         "model": turn.model,
         "error": turn.error,
+        "plan": turn.plan.to_dict() if turn.plan else None,
         "outcomes": [
             {
                 "action": outcome.proposal.action.name,

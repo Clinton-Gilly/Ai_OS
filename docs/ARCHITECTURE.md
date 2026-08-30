@@ -4,7 +4,9 @@
 
 ```
 ai_os/
-  agent.py         supervisor: request -> proposals -> approval -> execution
+  agent.py         supervisor: request -> plan -> proposals -> approval -> run
+  planner.py       breaks a compound request into an ordered, reviewable plan
+  memory.py        what AI OS learns and is told; feeds the system prompt
   safety.py        permission engine: risk tiers, policies, folder whitelist
   audit.py         SQLite audit log, undo stack, memory table
   undo.py          reverses executed actions from the undo stack
@@ -13,6 +15,8 @@ ai_os/
   cli.py           command line, including the terminal approval queue
   trash.py         Recycle Bin, with a reversible fallback elsewhere
   startup.py       start-on-boot toggle (HKCU Run key)
+  hotkey.py        global hotkey via RegisterHotKey on its own message loop
+  voice.py         optional push-to-talk transcription
   platform_win.py  the Windows-specific calls, with off-Windows fallbacks
   llm/
     base.py        provider-neutral Message / ToolCall / LLMResponse
@@ -24,9 +28,11 @@ ai_os/
     base.py        the Skill / ActionDef contract
     registry.py    the tool router
     filesystem.py apps.py browser.py power.py system.py
+    diagnostics.py scheduler.py memory_skill.py
   gui/
-    window.py      Tkinter shell: chat, approvals, audit, settings
+    window.py      Tkinter shell: chat, approvals, audit, memory, settings
     approval.py    thread-safe approval queue behind the window
+    palette.py     the Spotlight-style command palette
 ```
 
 ## The request path
@@ -34,8 +40,12 @@ ai_os/
 ```
        ┌────────────┐   natural language   ┌────────────┐
        │ CLI / GUI  │ ───────────────────▶ │ Supervisor │
-       └────────────┘                      └─────┬──────┘
-              ▲                                  │ tool schemas
+       │  palette   │                      └─────┬──────┘
+       │   voice    │                            │ compound? plan it first
+       └────────────┘                      ┌─────▼──────┐
+              ▲                            │  Planner   │ ── approved as a whole
+              │                            └─────┬──────┘
+              │                                  │ tool schemas
               │                            ┌─────▼──────┐
               │                            │ LLM router │ ── Claude / OpenAI / local
               │                            └─────┬──────┘
@@ -49,14 +59,40 @@ ai_os/
                                            ┌─────▼──────┐
                                            │Skill (tool)│ dry-run or execute
                                            └─────┬──────┘
-                                 ┌───────────────┴────────────┐
-                           ┌─────▼─────┐               ┌──────▼─────┐
-                           │ Audit log │               │ Undo stack │
-                           └───────────┘               └────────────┘
+                   ┌─────────────────────────────┴─────────────────────────┐
+                   │                             │                         │
+             ┌─────▼─────┐                ┌──────▼─────┐              ┌─────▼────┐
+             │ Audit log │                │ Undo stack │              │  Memory  │
+             └───────────┘                └────────────┘              └──────────┘
 ```
 
 Tool results are fed back to the model so it can summarize what actually
-happened, bounded by `max_tool_iterations`.
+happened, bounded by `max_tool_iterations` (raised to fit an approved plan).
+
+## Planning
+
+`looks_compound()` is a cheap gate — no planning call is spent on "delete
+a.txt". When it fires, the planner asks the model for JSON steps, the user
+approves or edits the plan as a whole, and the approved plan is placed in the
+executing model's system prompt behind `PLAN_CONTEXT_MARKER`. A provider that
+does not reason over prose can call `parse_context_steps()` to walk the plan a
+step at a time; the offline rule provider does exactly that, which is how
+planning works with no API key.
+
+A rejected plan ends the turn before any action is proposed. An approved plan
+does not weaken anything downstream: every step is still classified, checked
+against the whitelist, and individually approved if its tier says so.
+
+## Memory
+
+`MemoryStore` wraps the `memory` table. It is written from three places — the
+supervisor after each turn (folders touched, apps opened, sequences repeated),
+the `memory` skill when you tell it something, and the Settings page — and read
+in one: `context_block()`, a short summary injected into the system prompt and
+explicitly labelled as context rather than instructions.
+
+Memory records that a folder was used and how often, never its contents. Turning
+it off in Settings stops both the learning and the prompt injection.
 
 ## Writing a skill
 

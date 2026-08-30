@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..planner import PLAN_CONTEXT_MARKER, PLAN_MARKER, parse_context_steps
 from .base import LLMResponse, Message, Provider, ToolCall
 
 Rule = tuple[re.Pattern[str], str, Callable[[re.Match[str]], dict[str, Any]]]
@@ -49,8 +50,55 @@ def resolve_folder(value: str) -> str:
     return str(Path(text).expanduser())
 
 
+def _reminder_name(message: str) -> str:
+    """A short, stable task name taken from the reminder text."""
+    words = re.findall(r"[A-Za-z0-9]+", message)[:4]
+    return " ".join(words) or "reminder"
+
+
 RULES: list[Rule] = [
+    # Diagnostics and memory phrasings are specific, so they are matched first.
+    (re.compile(r"\bwhy(?:'s| is)?\b[^.]*\b(?:slow|sluggish|laggy|freezing)\b"
+                r"|\bdiagnos(?:e|tic|tics)\b"
+                r"|\bwhat(?:'s| is) (?:making|slowing) (?:it|my|the)\b", re.I),
+     "diag_report", lambda m: {}),
+    (re.compile(r"\b(?:top|heaviest|biggest|hungriest) (?:processes|apps|programs)\b"
+                r"|\bwhat(?:'s| is) using (?:up )?(?:my |the )?(?:memory|ram)\b", re.I),
+     "diag_top_processes", lambda m: {}),
+    (re.compile(r"\bstartup (?:programs|items|apps|applications)\b"
+                r"|\bwhat starts (?:up )?(?:when i (?:sign|log) in|on boot)\b", re.I),
+     "diag_startup_items", lambda m: {}),
+    (re.compile(r"\b(?:large|big|biggest|largest) files\b(?:\s+(?:in|under|on)\s+"
+                r"(?:my\s+)?(?P<target>[\w .:\\/-]+?))?\s*$", re.I),
+     "diag_large_files",
+     lambda m: {"path": resolve_folder(m.group("target") or "home")}),
+    (re.compile(r"\bwhat do you remember\b|\bshow (?:me )?(?:your |my )?memor(?:y|ies)\b"
+                r"|\bwhat(?:'s| is) in (?:your )?memory\b", re.I),
+     "memory_list", lambda m: {}),
+    (re.compile(r"\bforget everything\b|\bclear (?:your |my )?memory\b"
+                r"|\bwipe (?:your |my )?memory\b", re.I),
+     "memory_forget", lambda m: {}),
+    (re.compile(r"\bremember that (?P<key>.+?) (?:is|are|=) (?P<value>.+?)\s*$", re.I),
+     "memory_remember",
+     lambda m: {"kind": "fact", "key": m.group("key").strip(),
+                "value": m.group("value").strip()}),
+    (re.compile(r"\bremind me\s+(?P<when>(?:at|in)\s+[\w: ]+?)\s+to\s+"
+                r"(?P<message>.+?)\s*$", re.I),
+     "schedule_reminder",
+     lambda m: {"name": _reminder_name(m.group("message")),
+                "message": m.group("message").strip(),
+                "when": m.group("when").strip()}),
+    (re.compile(r"\bremind me\s+(?:to\s+)?(?P<message>.+?)\s+"
+                r"(?P<when>(?:at|in)\s+[\w: ]+?)\s*$", re.I),
+     "schedule_reminder",
+     lambda m: {"name": _reminder_name(m.group("message")),
+                "message": m.group("message").strip(),
+                "when": m.group("when").strip()}),
+    (re.compile(r"\b(?:list|show)\b[^.]*\bscheduled tasks\b"
+                r"|\bwhat(?:'s| is) scheduled\b", re.I),
+     "schedule_list", lambda m: {}),
     (re.compile(r"\bwhat time is it\b|\bwhat(?:'s| is) the (?:time|date)\b"
+                r"|\b(?:tell|give) me the (?:time|date)\b"
                 r"|\bwhat day is it\b|^\s*time\s*$", re.I),
      "system_time", lambda m: {}),
     (re.compile(r"\b(?:disk (?:space|usage)|how much (?:space|storage))\b", re.I),
@@ -106,6 +154,33 @@ class LocalRuleProvider(Provider):
     requires_api_key = False
 
     def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> LLMResponse:
+        # A planning request: split the sentence rather than act on it.
+        if any(PLAN_MARKER in message.content for message in messages
+               if message.role == "system"):
+            request = next(
+                (m.content for m in reversed(messages) if m.role == "user"), "")
+            return LLMResponse(text=json.dumps(_plan_offline(request)),
+                               model=self.model or "rules-v1")
+
+        available = {tool["name"] for tool in tools}
+
+        # Executing an approved plan: walk it a step at a time, using the count
+        # of results already returned as the position in the plan.
+        plan_context = next(
+            (m.content for m in messages
+             if m.role == "system" and PLAN_CONTEXT_MARKER in m.content), "")
+        if plan_context:
+            steps = parse_context_steps(plan_context)
+            done = sum(1 for message in messages if message.role == "tool")
+            if done < len(steps):
+                call = self._match(steps[done].description, available)
+                if call is not None:
+                    return LLMResponse(tool_calls=[call],
+                                       model=self.model or "rules-v1")
+            if done:
+                return LLMResponse(text=_summarize_results(messages),
+                                   model=self.model or "rules-v1")
+
         # Tool results already came back: summarize instead of acting again.
         if messages and messages[-1].role == "tool":
             return LLMResponse(text=_summarize_results(messages),
@@ -114,20 +189,10 @@ class LocalRuleProvider(Provider):
         request = next(
             (m.content for m in reversed(messages) if m.role == "user"), ""
         ).strip()
-        available = {tool["name"] for tool in tools}
 
-        # More specific rules are listed first; the first match wins.
-        for pattern, tool_name, build in RULES:
-            if tool_name not in available:
-                continue
-            match = pattern.search(request)
-            if match:
-                arguments = {k: v for k, v in build(match).items() if v not in (None, "")}
-                return LLMResponse(
-                    tool_calls=[ToolCall(id=f"local-{tool_name}", name=tool_name,
-                                         arguments=arguments)],
-                    model=self.model or "rules-v1",
-                )
+        call = self._match(request, available)
+        if call is not None:
+            return LLMResponse(tool_calls=[call], model=self.model or "rules-v1")
 
         return LLMResponse(
             text=(
@@ -138,17 +203,71 @@ class LocalRuleProvider(Provider):
             model=self.model or "rules-v1",
         )
 
+    def _match(self, text: str, available: set[str]) -> ToolCall | None:
+        """First matching rule wins; more specific rules are listed first."""
+        for pattern, tool_name, build in RULES:
+            if tool_name not in available:
+                continue
+            match = pattern.search(text)
+            if match:
+                arguments = {k: v for k, v in build(match).items()
+                             if v not in (None, "")}
+                return ToolCall(id=f"local-{tool_name}", name=tool_name,
+                                arguments=arguments)
+        return None
+
 
 def _summarize_results(messages: list[Message]) -> str:
-    """Read back the messages from the tool results at the end of the exchange."""
+    """Read back every tool result in the exchange, in the order they happened."""
     lines: list[str] = []
-    for message in reversed(messages):
+    for message in messages:
         if message.role != "tool":
-            break
+            continue
         try:
             payload = json.loads(message.content)
         except json.JSONDecodeError:
             lines.append(message.content)
             continue
         lines.append(str(payload.get("message") or payload.get("status", "")))
-    return " ".join(line for line in reversed(lines) if line)
+    return " ".join(line for line in lines if line)
+
+
+# Conjunctions that separate one instruction from the next, longest first so
+# "and then" is not split by the shorter "and".
+_SPLITTERS = (
+    " and then ", ", then ", " then ", " after that ", " followed by ",
+    " and also ", " as well as ", ", and ", " and ",
+)
+
+
+def split_request(request: str) -> list[str]:
+    """Break a compound sentence into the instructions it contains."""
+    parts = [request.strip()]
+    for splitter in _SPLITTERS:
+        expanded: list[str] = []
+        for part in parts:
+            expanded.extend(piece.strip() for piece in part.lower().split(splitter))
+        parts = [piece for piece in expanded if piece]
+    return parts
+
+
+def _plan_offline(request: str) -> dict[str, Any]:
+    """Build a plan by matching each clause against the rule table."""
+    steps: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    for clause in split_request(request):
+        matched = None
+        for pattern, tool_name, _build in RULES:
+            if pattern.search(clause):
+                matched = tool_name
+                break
+        if matched:
+            steps.append({"description": clause, "action": matched})
+        else:
+            unmatched.append(clause)
+    notes = ""
+    if unmatched:
+        notes = ("The offline rule provider could not match: "
+                 + "; ".join(unmatched)
+                 + ". Configure a model provider for full understanding.")
+    return {"steps": steps, "notes": notes}

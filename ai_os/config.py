@@ -72,6 +72,17 @@ class Config:
     log_prompts: bool = True
     max_tool_iterations: int = 4
 
+    # Intelligence layer (Phase 2).
+    planner_enabled: bool = True
+    planner_max_steps: int = 12
+    memory_enabled: bool = True
+    memory_context_items: int = 12
+    hotkey: str = "ctrl+alt+space"
+    hotkey_enabled: bool = True
+    voice_enabled: bool = False
+    voice_seconds: int = 8
+    voice_language: str = "en-US"
+
     def provider_config(self, name: str | None = None) -> ProviderConfig:
         name = name or self.provider
         return self.providers.setdefault(name, ProviderConfig())

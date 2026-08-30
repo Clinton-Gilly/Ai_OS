@@ -9,6 +9,8 @@ from .agent import Supervisor
 from .audit import AuditLog
 from .config import Config, load_config, save_config
 from .llm import LLMRouter
+from .memory import MemoryStore
+from .planner import Planner
 from .safety import SafetyEngine
 from .skills.registry import SkillRegistry, default_registry
 from .undo import UndoManager
@@ -25,6 +27,7 @@ class AiOS:
     safety: SafetyEngine
     supervisor: Supervisor
     undo: UndoManager
+    memory: MemoryStore
     config_path: Path | None = None
 
     @classmethod
@@ -32,11 +35,13 @@ class AiOS:
                db_path: Path | None = None,
                registry: SkillRegistry | None = None) -> AiOS:
         config = config or load_config(config_path)
-        registry = registry or default_registry()
         audit = AuditLog(db_path)
+        memory = MemoryStore(audit, config.memory_enabled)
+        registry = registry or default_registry(memory)
         router = LLMRouter(config)
         safety = SafetyEngine(config)
-        supervisor = Supervisor(config, registry, audit, router, safety)
+        supervisor = Supervisor(config, registry, audit, router, safety, memory,
+                                Planner(config.planner_max_steps))
         return cls(
             config=config,
             registry=registry,
@@ -45,6 +50,7 @@ class AiOS:
             safety=safety,
             supervisor=supervisor,
             undo=UndoManager(config, registry, audit),
+            memory=memory,
             config_path=config_path,
         )
 

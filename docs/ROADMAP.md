@@ -3,7 +3,7 @@
 The build order from the project plan. Something usable ships early rather than
 chasing the full spec before anything works.
 
-## Phase 1 — Core ✅ (this release)
+## Phase 1 — Core ✅
 
 - [x] Skill/plugin architecture from day one — no hardcoded `if/elif` command handling
 - [x] LLM router: Claude plus one OpenAI-compatible provider
@@ -15,19 +15,23 @@ chasing the full spec before anything works.
 - [x] Settings: provider and API key management, model choice, permission rules,
       allowed-folder whitelist, start-on-boot toggle
 
-Core control covered so far: file operations, application control, browser
-control, power control. Task scheduling (Windows Task Scheduler) is the
-remaining core-control item and is queued behind the Phase 2 planner.
+Core control covered: file operations, application control, browser control,
+power control.
 
-## Phase 2 — Intelligence
+## Phase 2 — Intelligence ✅ (this release)
 
-- [ ] Planner for multi-step requests ("prepare my laptop for development")
-- [ ] Memory system — inspectable and deletable, visible in Settings
-      (the `memory` table and its API already exist)
-- [ ] System diagnostics ("why is my computer slow")
-- [ ] Global hotkey and command palette
-- [ ] Voice input (push-to-talk first)
-- [ ] Task scheduling: one-off reminders and recurring tasks
+- [x] Planner for multi-step requests ("prepare my laptop for development"),
+      reviewed and editable as a whole before any step runs
+- [x] Memory system — inspectable and deletable, visible in Settings and from
+      `ai-os memory`; learns folders, apps, and repeated sequences
+- [x] System diagnostics ("why is my computer slow"), with suggested fixes
+- [x] Global hotkey and command palette
+- [x] Voice input (push-to-talk; optional extra, off by default)
+- [x] Task scheduling: one-off reminders and recurring tasks
+
+Learned workflows are recorded and counted (`ai-os memory list --kind
+workflow`); offering to save a repeated sequence as a single named command
+belongs with the workflow engine in Phase 3.
 
 ## Phase 3 — Automation platform
 

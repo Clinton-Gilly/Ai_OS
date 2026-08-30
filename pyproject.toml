@@ -28,6 +28,10 @@ windows = [
     "send2trash>=1.8",   # real Recycle Bin support
     "psutil>=5.9",       # richer process listing
 ]
+voice = [
+    "SpeechRecognition>=3.10",   # push-to-talk transcription
+    "PyAudio>=0.2.13",           # microphone access
+]
 dev = [
     "pytest>=7.4",
     "ruff>=0.5",

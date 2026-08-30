@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
+from typing import Any
 
 from .base import ActionDef, ActionResult, ExecContext, Skill, UndoRecord
 
@@ -74,12 +75,19 @@ class SkillRegistry:
         ]
 
 
-def default_registry() -> SkillRegistry:
-    """Registry with the Phase 1 skill set loaded."""
+def default_registry(memory: Any = None) -> SkillRegistry:
+    """Registry with the standard skill set loaded.
+
+    ``memory`` is a MemoryStore. Pass one to expose the memory skill; without
+    it every other skill still works, so a registry can be built with no
+    database behind it.
+    """
     from .apps import AppSkill
     from .browser import BrowserSkill
+    from .diagnostics import DiagnosticsSkill
     from .filesystem import FileSystemSkill
     from .power import PowerSkill
+    from .scheduler import SchedulerSkill
     from .system import SystemSkill
 
     registry = SkillRegistry()
@@ -89,5 +97,11 @@ def default_registry() -> SkillRegistry:
         BrowserSkill(),
         PowerSkill(),
         SystemSkill(),
+        DiagnosticsSkill(),
+        SchedulerSkill(),
     ])
+    if memory is not None:
+        from .memory_skill import MemorySkill
+
+        registry.register(MemorySkill(memory))
     return registry

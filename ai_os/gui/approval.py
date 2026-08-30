@@ -12,7 +12,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..agent import ApprovalResponse, Proposal
+from ..agent import ApprovalResponse, PlanResponse, Proposal
+from ..planner import Plan
 from ..skills.base import ActionResult
 
 
@@ -29,11 +30,25 @@ class PendingApproval:
         self.done.set()
 
 
+@dataclass
+class PendingPlan:
+    """A multi-step plan waiting for the user to approve it as a whole."""
+
+    plan: Plan
+    done: threading.Event = field(default_factory=threading.Event)
+    response: PlanResponse | None = None
+
+    def resolve(self, approved: bool, steps: list[str] | None = None,
+                note: str = "") -> None:
+        self.response = PlanResponse(approved, steps, note)
+        self.done.set()
+
+
 class QueueApprover:
     """Approver implementation backed by a thread-safe queue."""
 
     def __init__(self, timeout: float = 300.0) -> None:
-        self.queue: queue.Queue[PendingApproval] = queue.Queue()
+        self.queue: queue.Queue[PendingApproval | PendingPlan] = queue.Queue()
         self.timeout = timeout
 
     def review(self, proposal: Proposal,
@@ -44,7 +59,15 @@ class QueueApprover:
             return ApprovalResponse(False, note="approval timed out")
         return pending.response or ApprovalResponse(False, note="no response")
 
-    def next_pending(self) -> PendingApproval | None:
+    def review_plan(self, plan: Plan) -> PlanResponse:
+        """Block the worker thread until the window answers about the plan."""
+        pending = PendingPlan(plan)
+        self.queue.put(pending)
+        if not pending.done.wait(self.timeout):
+            return PlanResponse(False, note="plan approval timed out")
+        return pending.response or PlanResponse(False, note="no response")
+
+    def next_pending(self) -> PendingApproval | PendingPlan | None:
         try:
             return self.queue.get_nowait()
         except queue.Empty:
